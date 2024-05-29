@@ -11,15 +11,14 @@ import data_preprocessing.Log_dataloader as Log_dl
 import argparse
 import importlib
 from config import add_args
-from models.mobilenet import mobilenet
-from models.resnet import resnet50, resnet18, resnet10, resnet8
+from models.resnet import *
 from models.resnet_gradaug import resnet56 as resnet56_gradaug
 from models.resnet_gradaug import resnet18 as resnet18_gradaug
 from models.resnet_stochdepth import resnet56 as resnet56_stochdepth
 from models.resnet_stochdepth import resnet18 as resnet18_stochdepth
 from models.resnet_fedalign import resnet56 as resnet56_fedalign
 from models.resnet_fedalign import resnet18 as resnet18_fedalign
-from models.net import SimpleCNN, modVGG, OneDCNN
+from models.net import SimpleCNN, modVGG, OneDCNN, modVGG2
 from models.MLP import MLP
 from models.lenet5 import Lenet5
 from models.neurallog import NeuralLog, Head
@@ -103,7 +102,8 @@ if __name__ == "__main__":
     if not os.path.exists('{}'.format(wandb_log_dir)):
         os.makedirs('{}'.format(wandb_log_dir))
     odds = 'LT' if args.LT else ""
-    wandb.init(entity='lxjxlxj', project='FLMC_exp' + ('_M' if args.momentum else ''),
+    project_name = 'FLMC_exp' + ('_M' if args.momentum else '')
+    wandb.init(entity='lxjxlxj', project=project_name,
                group=args.data_dir.split('/')[-1] + odds + "_" + args.partition_method + "_" + args.net + "_" + (
                    str(args.partition_alpha) if args.partition_method == 'hetero' else "") \
                      + '_epochs:' + str(args.epochs) + '_client:' + str(args.client_number) + '_fraction:' \
@@ -118,13 +118,13 @@ if __name__ == "__main__":
     # get data
     if args.LT:
         _, _, train_data_global, test_data_global, _, train_data_local_dict, test_data_local_dict, class_num = \
-            dl.load_partition_data_LT(args.data_dir, args.partition_method, args.partition_alpha, args.client_number, args.batch_size, args.silos_number, imb_ratio=args.imbalance_ratio)
+            dl.load_partition_data_LT(args.data_dir, args.partition_method, args.partition_alpha, args.client_number if args.method != 'fedic' else args.client_number + 2, args.batch_size, args.silos_number, imb_ratio=args.imbalance_ratio)
     elif args.Log:
         _, _, train_data_global, test_data_global, _, train_data_local_dict, test_data_local_dict, class_num = \
             Log_dl.load_partition_data(args.data_dir, args.partition_method, args.partition_alpha, args.client_number, args.batch_size, args.silos_number)
     else:
         _, _, train_data_global, test_data_global, _, train_data_local_dict, test_data_local_dict, class_num = \
-            dl.load_partition_data(args.data_dir, args.partition_method, args.partition_alpha, args.client_number, args.batch_size, args.silos_number)
+            dl.load_partition_data(args.data_dir, args.partition_method, args.partition_alpha, args.client_number if args.method != 'fedic' else args.client_number + 2, args.batch_size, args.silos_number)
 
     mapping_dict = allocate_clients_to_threads(args)
     def import_class(module_name, class_name):
@@ -136,7 +136,7 @@ if __name__ == "__main__":
 
     if args.method in ['fedavg', 'fedavgweighted', 'fedratio', 'focal', 'fedmargin', 'fedgmmargin', 'fedgmmargin2', 'fedgmmargin3', 
                        'fedgmmargin4', 'fedgmmargin5', 'fedgmmargin6', 'fedcos', 'dmfl', 'dmfl2', 'dmfl3', 'fedlc', 'ccvr', 'fedrev', 
-                       'creff', 'fedprox', 'moon', 'feddebias', 'feddyn', 'fedrs', 'mixup', 'naivemix', 'globalmix', 'fedmix', 'balancefl']:
+                       'creff', 'fedprox', 'moon', 'feddebias', 'feddyn', 'fedrs', 'mixup', 'naivemix', 'globalmix', 'fedmix', 'balancefl', 'fedloge']:
         Model = eval(args.net)
         server_dict = {'train_data': train_data_global, 'test_data': test_data_global, 'model_type': Model,
                        'num_classes': class_num}
@@ -189,6 +189,15 @@ if __name__ == "__main__":
                         'device': i % torch.cuda.device_count(),
                         'client_map': mapping_dict[i], 'model_type': Model, 'num_classes': class_num,
                         'width_range': width_range, 'resolutions': resolutions} for i in range(args.thread_number)]
+    
+    elif args.method == 'fedic':
+        Model = eval(args.net)
+        server_dict = {'train_data': train_data_global, 'test_data': test_data_global, 'model_type': Model,
+                       'num_classes': class_num, 'client_train_data': train_data_local_dict}
+        client_dict = [{'train_data': train_data_local_dict, 'test_data': test_data_local_dict,
+                        'device': i % torch.cuda.device_count(),
+                        'client_map': mapping_dict[i], 'model_type': Model, 'num_classes': class_num} for i in
+                       range(args.thread_number)]
     else:
         raise ValueError('Invalid --method chosen! Please choose from availible methods.')
 
@@ -208,7 +217,8 @@ if __name__ == "__main__":
     server = Server(server_dict, args)
     server_outputs = server.start()
     # Start Federated Training
-    time.sleep(40 * (args.client_number / 16))  # Allow time for threads to start up
+    time.sleep(40 * (args.client_number / 8))  # Allow time for threads to start up
+
     for r in range(args.comm_round):
         logging.info('************** Round: {} ***************'.format(r))
         round_start = time.time()
@@ -217,6 +227,17 @@ if __name__ == "__main__":
         server_outputs = server.run(client_outputs)
         round_end = time.time()
         logging.info('Round {} Time: {}s'.format(r, round_end - round_start))
+
+    
+    if args.method == 'fedloge':
+        logging.info('************** Round: {} ***************'.format(r))
+        round_start = time.time()
+        client_outputs = pool.map(run_clients, server_outputs)
+        client_outputs = [c for sublist in client_outputs for c in sublist]
+        server_outputs = server.run(client_outputs)
+        round_end = time.time()
+        logging.info('Round {} Time: {}s'.format(args.comm_round + 1, round_end - round_start))
+
 
     server.finalize()
     pool.close()

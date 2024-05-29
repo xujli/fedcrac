@@ -3,17 +3,14 @@ Federated Dataset Loading and Partitioning
 Code based on https://github.com/FedML-AI/FedML
 '''
 import os
+import copy
 import logging
-
 import numpy as np
-from numpy.core.fromnumeric import mean
 import torch.utils.data as data
 import torchvision.transforms as transforms
 
-from scipy import io
-from data_preprocessing.datasets import CIFAR_truncated, MNIST_truncated, QUIC_truncated, ISCX_truncated, ImageFolder_custom
-from data_preprocessing.datasets_LT import CIFAR10_LT_truncated, CIFAR100_LT_truncated, MNIST_LT_truncated, ImageFolder_LT_custom, ISCX_LT_truncated
-from data_preprocessing.samplers import iid, dirichlet, orthogonal
+from data_preprocessing.datasets import CIFAR_truncated, MNIST_truncated, QUIC_truncated, ISCX_truncated, ImageFolder_custom, SVHN_truncated, CalTech_truncated, TinyImage_truncated
+from data_preprocessing.datasets_LT import CIFAR10_LT_truncated, CIFAR100_LT_truncated, MNIST_LT_truncated, ImageFolder_LT_custom, ISCX_LT_truncated, SVHN_LT_truncated, CalTech_LT_truncated, TinyImage_LT_truncated
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -55,6 +52,47 @@ def _data_transforms_cifar(datadir):
     return train_transform, valid_transform
 
 
+def _data_transforms_svhn(datadir):
+
+    SVHN_MEAN = [0.485,0.456,0.406]
+    SVHN_STD = [0.229,0.224,0.225]
+
+    train_transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(SVHN_MEAN, SVHN_STD),
+    ])
+
+    valid_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(SVHN_MEAN, SVHN_STD),
+    ])
+
+    return train_transform, valid_transform
+
+def _data_transforms_ISCX(datadir):
+    # if "cifar100" in datadir:
+    #     CIFAR_MEAN = [0.5071, 0.4865, 0.4409]
+    #     CIFAR_STD = [0.2673, 0.2564, 0.2762]
+    # else:
+    #     CIFAR_MEAN = [0.49139968, 0.48215827, 0.44653124]
+    #     CIFAR_STD = [0.24703233, 0.24348505, 0.26158768]
+
+    train_transform = transforms.Compose([
+        # transforms.ToPILImage(),
+        # transforms.RandomCrop(32, padding=4),
+        # transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+    ])
+
+    valid_transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    return train_transform, valid_transform
+
 def _data_transforms_mnist():
     train_transform = transforms.Compose([
         transforms.Normalize((0.1307,), (0.3081,))
@@ -88,14 +126,11 @@ def _data_transforms_imagenet(datadir):
     crop_scale = 0.08
     jitter_param = 0.4
     image_size = 64
-    image_resize = 68
+    image_resize = 36
 
     train_transform = transforms.Compose([
         transforms.ToPILImage(),
-        transforms.RandomResizedCrop(image_size, scale=(crop_scale, 1.0)),
-        transforms.ColorJitter(
-            brightness=jitter_param, contrast=jitter_param,
-            saturation=jitter_param),
+        transforms.RandomCrop(image_size, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
@@ -110,30 +145,14 @@ def _data_transforms_imagenet(datadir):
 
     return train_transform, valid_transform
 
-def _data_transforms_ISCX():
-    # if "cifar100" in datadir:
-    #     CIFAR_MEAN = [0.5071, 0.4865, 0.4409]
-    #     CIFAR_STD = [0.2673, 0.2564, 0.2762]
-    # else:
-    #     CIFAR_MEAN = [0.49139968, 0.48215827, 0.44653124]
-    #     CIFAR_STD = [0.24703233, 0.24348505, 0.26158768]
-
-    train_transform = transforms.Compose([
-        # transforms.ToPILImage(),
-        # transforms.RandomCrop(32, padding=4),
-        # transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-    ])
-
-    valid_transform = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-    return train_transform, valid_transform
 
 def load_data(datadir):
     if 'cifar' in datadir:
         train_transform, test_transform = _data_transforms_cifar(datadir)
         dl_obj = CIFAR_truncated
+    elif 'svhn' in datadir:
+        train_transform, test_transform = _data_transforms_svhn(datadir)
+        dl_obj = SVHN_truncated
     elif 'mnist' in datadir:
         if 'emnist' in datadir:
             train_transform, test_transform = _data_transforms_emnist()
@@ -144,25 +163,26 @@ def load_data(datadir):
         train_transform, test_transform = None, None
         dl_obj = QUIC_truncated
     elif 'ISCX' in datadir:
-        train_transform, test_transform = _data_transforms_ISCX()
+        train_transform, test_transform = _data_transforms_ISCX(datadir)
         dl_obj = ISCX_truncated
+    elif 'caltech' in datadir:
+        train_transform, test_transform = _data_transforms_imagenet(datadir)
+        dl_obj = CalTech_truncated
     else:
         train_transform, test_transform = _data_transforms_imagenet(datadir)
         dl_obj = ImageFolder_custom
     train_ds = dl_obj(datadir, train=True, download=True, transform=train_transform)
     test_ds = dl_obj(datadir, train=False, download=True, transform=test_transform)
 
-    y_train, y_test = train_ds.target, test_ds.target
-
-    return (y_train, y_test)
+    return train_ds, test_ds
 
 
 def partition_data(datadir, partition, n_nets, alpha, silos=5):
     logging.info("*********partition data***************")
-    y_train, y_test = load_data(datadir)
-    n_train = y_train.shape[0]
-    n_test = y_test.shape[0]
-    class_num = len(np.unique(y_train))
+    train_ds, test_ds = load_data(datadir)
+    n_train = train_ds.data.shape[0]
+    n_test = test_ds.data.shape[0]
+    class_num = len(train_ds.classes)
 
     if partition == "homo":
         total_num = n_train
@@ -181,7 +201,7 @@ def partition_data(datadir, partition, n_nets, alpha, silos=5):
             idx_batch = [[] for _ in range(n_nets)]
             # for each class in the dataset
             for k in range(K):
-                idx_k = np.where(y_train == k)[0]
+                idx_k = np.where(train_ds.target == k)[0]
                 np.random.shuffle(idx_k)
                 proportions = np.random.dirichlet(np.repeat(alpha, n_nets))
                 ## Balance
@@ -208,43 +228,67 @@ def partition_data(datadir, partition, n_nets, alpha, silos=5):
                     classes_silos[len(classes_silos) // silos * i: -1]
             idx_i = []
             for class_id in classes_ids:
-                idx_k = np.where(y_train == class_id)[0]
+                idx_k = np.where(train_ds.target == class_id)[0]
                 idx_i.extend(idx_k)
             np.random.shuffle(idx_i)
             batch_idxs = np.array_split(idx_i, n_nets // silos)
             for j in range(n_nets // silos):
                 net_dataidx_map[i * n_nets // silos + j] = batch_idxs[j]
 
-    traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
+    traindata_cls_counts = record_net_data_stats(train_ds.target, net_dataidx_map)
 
-    return class_num, net_dataidx_map, traindata_cls_counts
+    return class_num, net_dataidx_map, traindata_cls_counts, train_ds, test_ds
 
 
 # for centralized training
-def get_dataloader(datadir, train_bs, test_bs, dataidxs=None):
+def get_dataloader(datadir, train_bs, test_bs, train_ds, test_ds, dataidxs=None):
     if 'cifar' in datadir:
         train_transform, test_transform = _data_transforms_cifar(datadir)
         dl_obj = CIFAR_truncated
+        workers = 0
+        persist = False
+    elif 'svhn' in datadir:
+        train_transform, test_transform = _data_transforms_svhn(datadir)
+        dl_obj = SVHN_truncated
+        workers = 0
+        persist = False
     elif 'mnist' in datadir:
         train_transform, test_transform = _data_transforms_emnist() if 'emnist' in datadir else _data_transforms_mnist()
         dl_obj = MNIST_truncated
+        workers = 0
+        persist = False
     elif 'QUIC' in datadir:
         train_transform, test_transform = None, None
         dl_obj = QUIC_truncated
+        workers = 0
+        persist = False
     elif 'ISCX' in datadir:
-        train_transform, test_transform = _data_transforms_ISCX()
+        train_transform, test_transform = _data_transforms_ISCX(datadir)
         dl_obj = ISCX_truncated
+        workers = 0
+        persist = False
+    elif 'tiny_imagenet' in datadir:
+        train_transform, test_transform = _data_transforms_imagenet(datadir)
+        dl_obj = TinyImage_truncated
+        workers = 0
+        persist = False
+    elif 'caltech' in datadir:
+        train_transform, test_transform = _data_transforms_imagenet(datadir)
+        dl_obj = CalTech_truncated
+        workers = 0
+        persist = False
     else:
         train_transform, test_transform = _data_transforms_imagenet(datadir)
         dl_obj = ImageFolder_custom
-        
-    workers = 0
-    persist = False
+        workers = 0
+        persist = False
 
-    train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=train_transform, download=True)
-    test_ds = dl_obj(datadir, train=False, transform=test_transform, download=True)
+    # train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=train_transform, download=True)
+    # test_ds = dl_obj(datadir, train=False, transform=test_transform, download=True)
 
-    train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=True, num_workers=workers,
+    subset_sampler = data.SubsetRandomSampler(dataidxs) if dataidxs else None
+
+    train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, num_workers=workers, sampler=subset_sampler,
                                persistent_workers=persist)
     test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=True, num_workers=workers,
                               persistent_workers=persist)
@@ -256,13 +300,13 @@ def load_partition_data(data_dir, partition_method, partition_alpha, client_numb
     # if not os.path.exists(
     #         'processed_{}_{}_{}_{}_{}'.format(data_dir.split('/')[1], partition_method, partition_alpha, client_number,
     #                                           batch_size)):
-    class_num, net_dataidx_map, traindata_cls_counts = partition_data(data_dir, partition_method, client_number,
+    class_num, net_dataidx_map, traindata_cls_counts, train_ds, test_ds = partition_data(data_dir, partition_method, client_number,
                                                                       partition_alpha, silos)
 
     logging.info("traindata_cls_counts = " + str(traindata_cls_counts))
     train_data_num = sum([len(net_dataidx_map[r]) for r in range(client_number)])
 
-    train_data_global, test_data_global = get_dataloader(data_dir, 5, 5)
+    train_data_global, test_data_global = get_dataloader(data_dir, 5, 5, train_ds, test_ds)
     logging.info("train_dl_global number = " + str(len(train_data_global)))
     logging.info("test_dl_global number = " + str(len(test_data_global)))
     test_data_num = len(test_data_global)
@@ -279,7 +323,7 @@ def load_partition_data(data_dir, partition_method, partition_alpha, client_numb
         logging.info("client_idx = %d, local_sample_number = %d" % (client_idx, local_data_num))
 
         # training batch size = 64; algorithms batch size = 32
-        train_data_local, test_data_local = get_dataloader(data_dir, batch_size, batch_size, dataidxs)
+        train_data_local, test_data_local = get_dataloader(data_dir, batch_size, batch_size, train_ds, test_ds, dataidxs)
         logging.info("client_idx = %d, batch_num_train_local = %d, batch_num_test_local = %d" % (
             client_idx, len(train_data_local), len(test_data_local)))
         train_data_local_dict[client_idx] = train_data_local
@@ -291,11 +335,12 @@ def load_partition_data(data_dir, partition_method, partition_alpha, client_numb
 
 def partition_data_LT(datadir, partition, n_nets, alpha, silos=5, imb_type='exp', imb_ratio=0.1):
     logging.info("*********partition data***************")
-    y_train, y_test = load_data_LT(datadir, imb_type, imb_ratio)
-    n_train = y_train.shape[0]
-    n_test = y_test.shape[0]
-
-    class_num = len(np.unique(y_train))
+    train_ds, test_ds = load_data_LT(datadir, imb_type, imb_ratio)
+    
+    n_train = train_ds.target.shape[0]
+    n_test = test_ds.target.shape[0]
+    
+    class_num = len(train_ds.classes)
 
     if partition == "homo":
         total_num = n_train
@@ -314,7 +359,7 @@ def partition_data_LT(datadir, partition, n_nets, alpha, silos=5, imb_type='exp'
             idx_batch = [[] for _ in range(n_nets)]
             # for each class in the dataset
             for k in range(K):
-                idx_k = np.where(y_train == k)[0]
+                idx_k = np.where(train_ds.target == k)[0]
                 np.random.shuffle(idx_k)
                 proportions = np.random.dirichlet(np.repeat(alpha, n_nets))
                 ## Balance
@@ -341,7 +386,7 @@ def partition_data_LT(datadir, partition, n_nets, alpha, silos=5, imb_type='exp'
                     classes_silos[len(classes_silos) // silos * i: -1]
             idx_i = []
             for class_id in classes_ids:
-                idx_k = np.where(y_train == class_id)[0]
+                idx_k = np.where(train_ds.target == class_id)[0]
                 idx_i.extend(idx_k)
             np.random.shuffle(idx_i)
             batch_idxs = np.array_split(idx_i, n_nets // silos)
@@ -349,15 +394,18 @@ def partition_data_LT(datadir, partition, n_nets, alpha, silos=5, imb_type='exp'
                 net_dataidx_map[i * n_nets // silos + j] = batch_idxs[j]
 
 
-    traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
+    traindata_cls_counts = record_net_data_stats(train_ds.target, net_dataidx_map)
 
-    return class_num, net_dataidx_map, traindata_cls_counts
+    return class_num, net_dataidx_map, traindata_cls_counts, train_ds, test_ds
 
 
 def load_data_LT(datadir, imb_type, imb_ratio):
     if 'cifar100' in datadir:
         train_transform, test_transform = _data_transforms_cifar(datadir)
         dl_obj = CIFAR100_LT_truncated
+    elif 'svhn' in datadir:
+        train_transform, test_transform = _data_transforms_svhn(datadir)
+        dl_obj = SVHN_LT_truncated
     elif 'cifar10' in datadir:
         train_transform, test_transform = _data_transforms_cifar(datadir)
         dl_obj = CIFAR10_LT_truncated
@@ -368,25 +416,35 @@ def load_data_LT(datadir, imb_type, imb_ratio):
             train_transform, test_transform = _data_transforms_mnist()
         dl_obj = MNIST_LT_truncated
     elif 'ISCX' in datadir:
-        train_transform, test_transform = _data_transforms_ISCX()
+        train_transform, test_transform = _data_transforms_ISCX(datadir)
         dl_obj = ISCX_LT_truncated
+    elif 'caltech' in datadir:
+        train_transform, test_transform = _data_transforms_imagenet(datadir)
+        dl_obj = CalTech_LT_truncated
+    elif 'tiny_imagenet' in datadir:
+        train_transform, test_transform = _data_transforms_imagenet(datadir)
+        dl_obj = TinyImage_LT_truncated
     else:
         train_transform, test_transform = _data_transforms_imagenet(datadir)
         dl_obj = ImageFolder_LT_custom
+
     train_ds = dl_obj(datadir, train=True, download=True, transform=train_transform, imb_type=imb_type, imb_ratio=imb_ratio)
     test_ds = dl_obj(datadir, train=False, download=True, transform=test_transform, imb_type=imb_type, imb_ratio=imb_ratio)
-
-    y_train, y_test = train_ds.target, test_ds.target
-
-    return (y_train, y_test)
+   
+    return train_ds, test_ds
 
 
 # for centralized training
-def get_dataloader_LT(datadir, train_bs, test_bs, dataidxs=None, imb_type='exp', imb_ratio=0.1):
+def get_dataloader_LT(datadir, train_bs, test_bs, train_ds, test_ds, dataidxs=None, imb_type='exp', imb_ratio=0.1):
 
     if 'cifar100' in datadir:
         train_transform, test_transform = _data_transforms_cifar(datadir)
         dl_obj = CIFAR100_LT_truncated
+        workers = 0
+        persist = False
+    elif 'svhn' in datadir:
+        train_transform, test_transform = _data_transforms_svhn(datadir)
+        dl_obj = SVHN_LT_truncated
         workers = 0
         persist = False
     elif 'cifar10' in datadir:
@@ -400,8 +458,13 @@ def get_dataloader_LT(datadir, train_bs, test_bs, dataidxs=None, imb_type='exp',
         workers = 0
         persist = False
     elif 'ISCX' in datadir:
-        train_transform, test_transform = _data_transforms_ISCX()
+        train_transform, test_transform = _data_transforms_ISCX(datadir)
         dl_obj = ISCX_LT_truncated
+        workers = 0
+        persist = False
+    elif 'caltech' in datadir:
+        train_transform, test_transform = _data_transforms_imagenet(datadir)
+        dl_obj = CalTech_LT_truncated
         workers = 0
         persist = False
     else:
@@ -410,24 +473,25 @@ def get_dataloader_LT(datadir, train_bs, test_bs, dataidxs=None, imb_type='exp',
         workers = 0
         persist = False
 
-    train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=train_transform, download=True, imb_type=imb_type, imb_ratio=imb_ratio)
-    test_ds = dl_obj(datadir, train=False, transform=test_transform, download=True, imb_type=imb_type, imb_ratio=imb_ratio)
-
-    train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=True, num_workers=workers,
+    # train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=train_transform, download=True, imb_type=imb_type, imb_ratio=imb_ratio)
+    # test_ds = dl_obj(datadir, train=False, transform=test_transform, download=True, imb_type=imb_type, imb_ratio=imb_ratio)
+        
+    subset_sampler = data.SubsetRandomSampler(dataidxs) if dataidxs else None
+    train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, num_workers=workers, sampler=subset_sampler,
                                persistent_workers=persist)
     test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False, drop_last=True, num_workers=workers,
                               persistent_workers=persist)
-    print(len(train_ds))
+
     return train_dl, test_dl
 
 def load_partition_data_LT(data_dir, partition_method, partition_alpha, client_number, batch_size, silos, imb_type='exp', imb_ratio=0.5):
-    class_num, net_dataidx_map, traindata_cls_counts = partition_data_LT(data_dir, partition_method, client_number,
+    class_num, net_dataidx_map, traindata_cls_counts, train_ds, test_ds = partition_data_LT(data_dir, partition_method, client_number,
                                                                       partition_alpha, silos, imb_type=imb_type, imb_ratio=imb_ratio)
 
     logging.info("traindata_cls_counts = " + str(traindata_cls_counts))
     train_data_num = sum([len(net_dataidx_map[r]) for r in range(client_number)])
 
-    train_data_global, test_data_global = get_dataloader_LT(data_dir, 5, 5, imb_type=imb_type, imb_ratio=imb_ratio)
+    train_data_global, test_data_global = get_dataloader_LT(data_dir, 5, 5, train_ds, test_ds, imb_type=imb_type, imb_ratio=imb_ratio)
     logging.info("train_dl_global number = " + str(len(train_data_global)))
     logging.info("test_dl_global number = " + str(len(test_data_global)))
     test_data_num = len(test_data_global)
@@ -444,7 +508,7 @@ def load_partition_data_LT(data_dir, partition_method, partition_alpha, client_n
         logging.info("client_idx = %d, local_sample_number = %d" % (client_idx, local_data_num))
 
         # training batch size = 64; algorithms batch size = 32
-        train_data_local, test_data_local = get_dataloader_LT(data_dir, batch_size, batch_size, dataidxs, imb_type=imb_type, imb_ratio=imb_ratio)
+        train_data_local, test_data_local = get_dataloader_LT(data_dir, batch_size, batch_size, train_ds, test_ds, dataidxs, imb_type=imb_type, imb_ratio=imb_ratio)
         logging.info("client_idx = %d, batch_num_train_local = %d, batch_num_test_local = %d" % (
             client_idx, len(train_data_local), len(test_data_local)))
         train_data_local_dict[client_idx] = train_data_local
@@ -520,31 +584,31 @@ if __name__ == '__main__':
                           left=0.1, right=0.99, bottom=0.1, top=0.95,
                           wspace=0.01, hspace=0.04)
 
+    fontsize = 50
     ax = fig.add_subplot(gs[1, 0])
     ax_histx = fig.add_subplot(gs[0, 0], sharex=ax)
     ax_histy = fig.add_subplot(gs[1, 1], sharey=ax)
     ax_histx.set_yticks(np.arange(0, int(np.max(np.sum(client_num_matrix, axis=1))), 500),
-                        np.arange(0, int(np.max(np.sum(client_num_matrix, axis=1))), 500), fontsize=20)
+                        np.arange(0, int(np.max(np.sum(client_num_matrix, axis=1))), 500), fontsize=fontsize)
     ax_histy.set_xticks(np.arange(0, int(np.max(np.sum(client_num_matrix, axis=0))), 2000),
-                        np.arange(0, int(np.max(np.sum(client_num_matrix, axis=0))), 2000), fontsize=20)
+                        np.arange(0, int(np.max(np.sum(client_num_matrix, axis=0))), 2000), fontsize=fontsize)
     ax_histx.xaxis.set_visible(False)
     ax_histy.yaxis.set_visible(False)
 
     im = im_hist(client_num_matrix.T, ax, ax_histx, ax_histy)
-    fontsize = 30
-    ax.set_xlabel('Client ID', fontsize=30)
-    ax.set_ylabel('Class ID', fontsize=30)
-    ax.set_xticks(np.arange(0, 50, 10), np.arange(0, 50, 10), fontsize=30)
-    ax.set_yticks(np.arange(0, class_num, 2), np.arange(0, class_num, 2), fontsize=30)
+    ax.set_xlabel('Client ID', fontsize=60)
+    ax.set_ylabel('Class ID', fontsize=60)
+    ax.set_xticks(np.arange(0, 50, 10), np.arange(0, 50, 10), fontsize=fontsize)
+    ax.set_yticks(np.arange(0, class_num, 2), np.arange(0, class_num, 2), fontsize=fontsize)
     # use the previously defined function
 
     ax_colorbar = fig.add_subplot(gs[0, 1])
     fig.colorbar(im, cax=ax_colorbar, orientation='horizontal')
     ax_colorbar.xaxis.set_ticks(np.arange(0, np.max(client_num_matrix), 100).astype(np.int),
-                                np.arange(0, np.max(client_num_matrix), 100).astype(np.int), fontsize=30)
+                                np.arange(0, np.max(client_num_matrix), 100).astype(np.int), fontsize=fontsize)
     ax_colorbar.xaxis.tick_top()
     # cb_ax = fig.add_axes([1.0, 0.1, 0.02, 0.8])  # 设置colarbar位置
     # cbar = fig.colorbar(ax)  # 共享colorbar
-    # plt.tight_layout(pad=.01)
+    plt.tight_layout(pad=.01)
     # plt.savefig()
     plt.show()

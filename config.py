@@ -11,7 +11,7 @@ def add_args(parser):
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="data/IC/cifar10",
+        default="data/cifar10",
         help="data directory: data/cifar100, data/cifar10, or another dataset",
     )
 

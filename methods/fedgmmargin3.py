@@ -6,10 +6,10 @@ import json
 import logging
 import pandas as pd
 import numpy as np
+import cupy as cp
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-from torch.nn.modules.loss import _WeightedLoss
 from torch.multiprocessing import current_process
 from torch.autograd.function import Function
 from sklearn.metrics import confusion_matrix
@@ -17,16 +17,22 @@ import math
 from copy import deepcopy
 import cv2
 
-import torch
+import time
 from torch.autograd import Variable
 from collections import OrderedDict
 from models.MarginLinear import SoftmaxMargin, SoftmaxMarginL
+
+
+cp.random.seed(1)
+
+
 def cost_matrix(x, y, p=2):
     "Returns the matrix of $|x_i-y_j|^p$."
     x_col = x.unsqueeze(1)
     y_lin = y.unsqueeze(0)
     c = torch.sum((torch.abs(x_col - y_lin)) ** p, 2)
     return c
+
 
 def sinkhorn_loss(x, y, epsilon, n, niter, device):
     """
@@ -41,14 +47,18 @@ def sinkhorn_loss(x, y, epsilon, n, niter, device):
     # both marginals are fixed with equal weights
     # mu = Variable(1. / n * torch.cuda.FloatTensor(n).fill_(1), requires_grad=False)
     # nu = Variable(1. / n * torch.cuda.FloatTensor(n).fill_(1), requires_grad=False)
-    mu = Variable(1. / n * torch.FloatTensor(n).fill_(1), requires_grad=False).to(device)
-    nu = Variable(1. / n * torch.FloatTensor(n).fill_(1), requires_grad=False).to(device)
+    mu = Variable(1.0 / n * torch.FloatTensor(n).fill_(1), requires_grad=False).to(
+        device
+    )
+    nu = Variable(1.0 / n * torch.FloatTensor(n).fill_(1), requires_grad=False).to(
+        device
+    )
 
     # Parameters of the Sinkhorn algorithm.
     rho = 1  # (.5) **2          # unbalanced transport
-    tau = -.8  # nesterov-like acceleration
+    tau = -0.8  # nesterov-like acceleration
     lam = rho / (rho + epsilon)  # Update exponent
-    thresh = 10**(-1)  # stopping criterion
+    thresh = 10 ** (-1)  # stopping criterion
 
     # Elementary operations .....................................................................
     def ave(u, u1):
@@ -62,10 +72,12 @@ def sinkhorn_loss(x, y, epsilon, n, niter, device):
 
     def lse(A):
         "log-sum-exp"
-        return torch.log(torch.exp(A).sum(1, keepdim=True) + 1e-6)  # add 10^-6 to prevent NaN
+        return torch.log(
+            torch.exp(A).sum(1, keepdim=True) + 1e-6
+        )  # add 10^-6 to prevent NaN
 
     # Actual Sinkhorn loop ......................................................................
-    u, v, err = 0. * mu, 0. * nu, 0.
+    u, v, err = 0.0 * mu, 0.0 * nu, 0.0
     actual_nits = 0  # to check if algorithm terminates because of threshold or max iterations reached
 
     for i in range(niter):
@@ -86,6 +98,7 @@ def sinkhorn_loss(x, y, epsilon, n, niter, device):
 
     return cost
 
+
 def sinkhorn_normalized(x, y, epsilon, n, niter, device):
 
     Wxy = sinkhorn_loss(x, y, epsilon, n, niter, device)
@@ -93,8 +106,10 @@ def sinkhorn_normalized(x, y, epsilon, n, niter, device):
     Wyy = sinkhorn_loss(y, y, epsilon, n, niter, device)
     return 2 * Wxy - Wxx - Wyy
 
+
 def one_hot(y, num_class):
     return torch.zeros((len(y), num_class)).to(y.device).scatter_(1, y.unsqueeze(1), 1)
+
 
 def emd_inference_opencv(cost_matrix, weight1, weight2):
     # cost matrix is a tensor of shape [N,N]
@@ -103,11 +118,24 @@ def emd_inference_opencv(cost_matrix, weight1, weight2):
     weight1 = F.relu(weight1) + 1e-5
     weight2 = F.relu(weight2) + 1e-5
 
-    weight1 = (weight1 * (weight1.shape[0] / weight1.sum().item())).view(-1, 1).detach().cpu().numpy()
-    weight2 = (weight2 * (weight2.shape[0] / weight2.sum().item())).view(-1, 1).detach().cpu().numpy()
+    weight1 = (
+        (weight1 * (weight1.shape[0] / weight1.sum().item()))
+        .view(-1, 1)
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    weight2 = (
+        (weight2 * (weight2.shape[0] / weight2.sum().item()))
+        .view(-1, 1)
+        .detach()
+        .cpu()
+        .numpy()
+    )
 
     cost, _, flow = cv2.EMD(weight1, weight2, cv2.DIST_USER, cost_matrix)
     return cost
+
 
 class LGMLoss_v0(torch.nn.Module):
     """
@@ -140,6 +168,7 @@ class LGMLoss_v0(torch.nn.Module):
         likelihood = (1.0 / batch_size) * cdiff.pow(2).sum(1).sum(0) / 2.0
         return logits, margin_logits, likelihood
 
+
 class LGMLoss(torch.nn.Module):
     """
     Refer to paper:
@@ -148,6 +177,7 @@ class LGMLoss(torch.nn.Module):
     re-implement by yirong mao
     2018 07/02
     """
+
     def __init__(self, num_classes, feat_dim, alpha):
         super(LGMLoss, self).__init__()
         self.feat_dim = feat_dim
@@ -161,14 +191,12 @@ class LGMLoss(torch.nn.Module):
         batch_size = feat.shape[0]
         log_covs = torch.unsqueeze(self.log_covs, dim=0)
 
-
-        covs = torch.exp(log_covs) # 1*c*d
-        tcovs = covs.repeat(batch_size, 1, 1) # n*c*d
+        covs = torch.exp(log_covs)  # 1*c*d
+        tcovs = covs.repeat(batch_size, 1, 1)  # n*c*d
         diff = torch.unsqueeze(feat, dim=1) - torch.unsqueeze(self.centers, dim=0)
         wdiff = torch.div(diff, tcovs)
         diff = torch.mul(diff, wdiff)
-        dist = torch.sum(diff, dim=-1) #eq.(18)
-
+        dist = torch.sum(diff, dim=-1)  # eq.(18)
 
         y_onehot = torch.FloatTensor(batch_size, self.num_classes)
         y_onehot.zero_()
@@ -177,19 +205,20 @@ class LGMLoss(torch.nn.Module):
         y_onehot = y_onehot + 1.0
         margin_dist = torch.mul(dist, y_onehot)
 
-        slog_covs = torch.sum(log_covs, dim=-1) #1*c
+        slog_covs = torch.sum(log_covs, dim=-1)  # 1*c
         tslog_covs = slog_covs.repeat(batch_size, 1)
-        margin_logits = -0.5*(tslog_covs + margin_dist) #eq.(17)
+        margin_logits = -0.5 * (tslog_covs + margin_dist)  # eq.(17)
         logits = -0.5 * (tslog_covs + dist)
 
         cdiff = feat - torch.index_select(self.centers, dim=0, index=label.long())
         cdist = cdiff.pow(2).sum(1).sum(0) / 2.0
 
         slog_covs = torch.squeeze(slog_covs)
-        reg = 0.5*torch.sum(torch.index_select(slog_covs, dim=0, index=label.long()))
-        likelihood = (1.0/batch_size) * (cdist + reg)
+        reg = 0.5 * torch.sum(torch.index_select(slog_covs, dim=0, index=label.long()))
+        likelihood = (1.0 / batch_size) * (cdist + reg)
 
         return logits, margin_logits, likelihood
+
 
 class CenterLoss(torch.nn.Module):
     def __init__(self, num_classes, feat_dim, size_average=True):
@@ -204,11 +233,18 @@ class CenterLoss(torch.nn.Module):
         feat = feat.view(batch_size, -1)
         # To check the dim of centers and features
         if feat.size(1) != self.feat_dim:
-            raise ValueError("Center's dim: {0} should be equal to input feature's \
-                            dim: {1}".format(self.feat_dim,feat.size(1)))
-        batch_size_tensor = feat.new_empty(1).fill_(batch_size if self.size_average else 1)
+            raise ValueError(
+                "Center's dim: {0} should be equal to input feature's \
+                            dim: {1}".format(
+                    self.feat_dim, feat.size(1)
+                )
+            )
+        batch_size_tensor = feat.new_empty(1).fill_(
+            batch_size if self.size_average else 1
+        )
         loss = self.centerlossfunc(feat, label, self.centers, batch_size_tensor)
         return loss
+
 
 class CenterlossFunc(Function):
     @staticmethod
@@ -228,19 +264,30 @@ class CenterlossFunc(Function):
         grad_centers = centers.new_zeros(centers.size())
 
         counts = counts.scatter_add_(0, label.long(), ones)
-        grad_centers.scatter_add_(0, label.unsqueeze(1).expand(feature.size()).long(), diff)
-        grad_centers = grad_centers/counts.view(-1, 1)
-        return - grad_output * diff / batch_size, None, grad_centers / batch_size, None
+        grad_centers.scatter_add_(
+            0, label.unsqueeze(1).expand(feature.size()).long(), diff
+        )
+        grad_centers = grad_centers / counts.view(-1, 1)
+        return -grad_output * diff / batch_size, None, grad_centers / batch_size, None
+
 
 in_features_dict = {
-    'Lenet5': 84,
-    'OneDCNN': 256,
-    'SimpleCNN': 84,
-    'modVGG': 512,
-    'modVGG2': 512,
-    'resnet10': 512,
-    'resnet18': 512,
-    'resnet56': 2048
+    "Lenet5": 84,
+    "OneDCNN": 256,
+    "SimpleCNN": 84,
+    "modVGG": 512,
+    "modVGG2": 512,
+    "modVGG3": 512,
+    "modVGG4": 512,
+    "modVGG6": 512,
+    "modVGG8": 512,
+    "vgg16": 1024,
+    "resnet8": 256,
+    "resnet10": 512,
+    "resnet18": 512,
+    "resnet56": 2048,
+    "mobilenet": 1280,
+    "Sent140LSTM": 512,
 }
 
 
@@ -253,9 +300,9 @@ def loss_fn_kd(outputs, labels, teacher_outputs):
     """
     alpha = 0.5
     T = 0.5
-    KD_loss = F.kl_div(F.log_softmax(outputs / T, dim=1),
-                             F.softmax(teacher_outputs / T, dim=1)) * (alpha * T * T) + \
-              F.cross_entropy(outputs, labels) * (1. - alpha)
+    KD_loss = F.kl_div(
+        F.log_softmax(outputs / T, dim=1), F.softmax(teacher_outputs / T, dim=1)
+    ) * (alpha * T * T) + F.cross_entropy(outputs, labels) * (1.0 - alpha)
 
     return KD_loss
 
@@ -263,11 +310,19 @@ def loss_fn_kd(outputs, labels, teacher_outputs):
 class Client(Base_Client):
     def __init__(self, client_dict, args):
         super().__init__(client_dict, args)
-        self.model = self.model_type(self.num_classes, KD=True, margin=args.mu).to(self.device)
-        self.clf_global = torch.clone(self.model.clf.weight.data.detach()).to(self.device)
+        self.model = self.model_type(
+            n_classes=self.num_classes, KD=True, margin=args.mu
+        ).to(self.device)
+        self.clf_global = torch.clone(self.model.clf.weight.data.detach()).to(
+            self.device
+        )
         self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.args.lr, momentum=0.9 if args.momentum else 0,# nesterov=True,
-                                         weight_decay=self.args.wd)
+        self.optimizer = torch.optim.SGD(
+            self.model.parameters(),
+            lr=self.args.lr,
+            momentum=0.9 if args.momentum else 0,  # nesterov=True,
+            weight_decay=self.args.wd,
+        )
 
         # self.optimzer4center = torch.optim.SGD(self.likelihood.parameters(), lr=0.01, momentum=0.9)
         self.global_model = deepcopy(self.model).to(self.device)
@@ -297,7 +352,11 @@ class Client(Base_Client):
             # self.centers = received_info[1]
             self.train_dataloader = self.train_data[client_idx]
             self.test_dataloader = self.test_data[client_idx]
-            if self.args.client_sample < 1.0 and self.train_dataloader._iterator is not None and self.train_dataloader._iterator._shutdown:
+            if (
+                self.args.client_sample < 1.0
+                and self.train_dataloader._iterator is not None
+                and self.train_dataloader._iterator._shutdown
+            ):
                 self.train_dataloader._iterator = self.train_dataloader._get_iterator()
             self.client_index = client_idx
             num_samples = len(self.train_dataloader) * self.args.batch_size
@@ -305,11 +364,20 @@ class Client(Base_Client):
             acc = self.test()
             dist = self.init_client_infos()
             client_results.append(
-                {'weights': weights, 'num_samples': num_samples, 'acc': acc,
-                 'client_index': self.client_index, 'dist': dist,
-                 'mean': self.centers.cpu(), 'cov': self.var.cpu()}
+                {
+                    "weights": weights,
+                    "num_samples": num_samples,
+                    "acc": acc,
+                    "client_index": self.client_index,
+                    "dist": dist,
+                    "mean": self.centers.cpu(),
+                    "cov": self.var.cpu(),
+                }
             )
-            if self.args.client_sample < 1.0 and self.train_dataloader._iterator is not None:
+            if (
+                self.args.client_sample < 1.0
+                and self.train_dataloader._iterator is not None
+            ):
                 self.train_dataloader._iterator._shutdown_workers()
 
         self.round += 1
@@ -336,8 +404,12 @@ class Client(Base_Client):
 
                 # unique_labels = torch.unique(labels)
                 if self.centers is None:
-                    self.centers = torch.zeros((self.num_classes, h.shape[1])).to(self.device)
-                    self.var = torch.zeros((self.num_classes, h.shape[1])).to(self.device)
+                    self.centers = torch.zeros((self.num_classes, h.shape[1])).to(
+                        self.device
+                    )
+                    self.var = torch.zeros((self.num_classes, h.shape[1])).to(
+                        self.device
+                    )
                 # for label in unique_labels:
                 #     selected_hs = h[labels == label, :]
                 #     centers[label] += torch.sum(selected_hs / (torch.norm(selected_hs, dim=1, keepdim=True)),
@@ -347,22 +419,35 @@ class Client(Base_Client):
                 # g_h, g_output = self.global_model(images, labels)
                 # cost = sinkhorn_normalized(probs, g_output, self.eposilon, h.shape[0], self.n_iter, self.device)
                 loss = self.criterion(logits, labels)
-                       # 0.1 * F.kl_div(F.log_softmax(h, dim=1),
-                       #                                         F.softmax(g_h, dim=1),
-                       #                                         reduction='batchmean')  # + 1 / phi
+                # 0.1 * F.kl_div(F.log_softmax(h, dim=1),
+                #                                         F.softmax(g_h, dim=1),
+                #                                         reduction='batchmean')  # + 1 / phi
                 loss.backward()
 
                 self.optimizer.step()
                 # self.optimzer4center.step()
                 batch_loss.append(loss.item())
-                hs = h.detach() if hs is None else torch.cat([hs, h.detach().clone()], dim=0)
-                labelss = labels if labelss is None else torch.cat([labelss, labels.clone()], dim=0)
+                hs = (
+                    h.detach()
+                    if hs is None
+                    else torch.cat([hs, h.detach().clone()], dim=0)
+                )
+                labelss = (
+                    labels
+                    if labelss is None
+                    else torch.cat([labelss, labels.clone()], dim=0)
+                )
             if len(batch_loss) > 0:
                 epoch_loss.append(sum(batch_loss) / len(batch_loss))
                 logging.info(
-                    '(client {}. Local Training Epoch: {} \tLoss: {:.6f}  Thread {}  Map {}'.format(self.client_index,
-                                                                                                    epoch, sum(
-                            epoch_loss) / len(epoch_loss), current_process()._identity[0], self.client_map[self.round]))
+                    "(client {}. Local Training Epoch: {} \tLoss: {:.6f}  Thread {}  Map {}".format(
+                        self.client_index,
+                        epoch,
+                        sum(epoch_loss) / len(epoch_loss),
+                        current_process()._identity[0],
+                        self.client_map[self.round],
+                    )
+                )
         # self.get_discriminability(hs, labelss)
 
         # indices = torch.not_equal(counts, 0)
@@ -419,34 +504,46 @@ class Client(Base_Client):
                 # test_loss += loss.item() * target.size(0)
                 test_sample_number += target.size(0)
             acc = (test_correct / test_sample_number) * 100
-            wandb_dict[self.args.method + "_clinet:{}_acc".format(self.client_index)] = acc
+            wandb_dict[
+                self.args.method + "_clinet:{}_acc".format(self.client_index)
+            ] = acc
             logging.info(
-                "************* Round {} Client {} Acc = {:.2f} **************".format(self.round, self.client_index,
-                                                                                      acc))
+                "************* Round {} Client {} Acc = {:.2f} **************".format(
+                    self.round, self.client_index, acc
+                )
+            )
         return acc
-
 
 
 class Server(Base_Server):
     def __init__(self, server_dict, args):
         super().__init__(server_dict, args)
-        self.model = self.model_type(self.num_classes, KD=True, margin=args.mu)
+        self.model = self.model_type(
+            n_classes=self.num_classes, KD=True, margin=args.mu
+        )
         wandb.watch(self.model)
-        self.likelihood = CenterLoss(self.num_classes, in_features_dict[self.args.net]).to(self.device)
+        # self.likelihood = CenterLoss(self.num_classes, in_features_dict[self.args.net]).to(self.device)
         self.mean, self.var = None, None
-        
+
     def start(self):
-        with open('{}/config.txt'.format(self.save_path), 'a+') as config:
+        with open("{}/config.txt".format(self.save_path), "a+") as config:
             config.write(json.dumps(vars(self.args)))
-        return [[self.model.cpu().state_dict(), self.args.mu * torch.ones((self.num_classes, self.num_classes))] for \
-                _ in range(self.args.thread_number)]
+        return [
+            [
+                self.model.cpu().state_dict(),
+                self.args.mu * torch.ones((self.num_classes, self.num_classes)),
+            ]
+            for _ in range(self.args.thread_number)
+        ]
 
     def run(self, received_info):
         server_outputs, client_acc = self.operations(received_info)
         acc = self.test(client_acc)
         self.log_info(received_info, acc)
         if acc > self.acc:
-            torch.save(self.model.state_dict(), '{}/{}.pt'.format(self.save_path, 'server'))
+            torch.save(
+                self.model.state_dict(), "{}/{}.pt".format(self.save_path, "server")
+            )
             self.acc = acc
         # for x in received_info:
         #     self.distances[x['client_index']] = x['centers']
@@ -455,34 +552,29 @@ class Server(Base_Server):
 
     def get_mean_var(self, client_info):
         # calculate global mean and covariance
-        self.client_dist = torch.stack([c['dist'] for c in client_info]).to(self.device)  # num_client, num_classes
-        centers = torch.stack([c['mean'] for c in client_info]).to(self.device) # num_client, num_classes, num_features
-        covs = torch.stack([c['cov'] for c in client_info]).to(self.device)  # num_client, num_classes, num_features
+        self.client_dist = torch.stack([c["dist"] for c in client_info]).to(
+            self.device
+        )  # num_client, num_classes
+        centers = torch.stack([c["mean"] for c in client_info]).to(
+            self.device
+        )  # num_client, num_classes, num_features
+        covs = torch.stack([c["cov"] for c in client_info]).to(
+            self.device
+        )  # num_client, num_classes, num_features
         if self.mean is None:
             self.mean = torch.zeros_like(centers[0]).to(self.device)
-            self.var = torch.zeros_like(covs[0]).to(self.device) # num_classes, num_features
-        for c in range(self.var.shape[0]):
+            self.var = torch.zeros_like(covs[0]).to(
+                self.device
+            )  # num_classes, num_features
+        for c in range(self.var.shape[0]):  # classses
             if torch.sum(self.client_dist[:, c]) > 0:
-                self.mean[c] = torch.sum(centers[:, c] * torch.unsqueeze(self.client_dist[:, c], 1), dim=0) \
-                               / torch.sum(self.client_dist[:, c])
-                self.var[c] = torch.sum(covs[:, c] * torch.unsqueeze(self.client_dist[:, c], 1), dim=0) \
-                               / torch.sum(self.client_dist[:, c])
+                self.mean[c] = torch.sum(
+                    centers[:, c] * torch.unsqueeze(self.client_dist[:, c], 1), dim=0
+                ) / torch.sum(self.client_dist[:, c])
+                self.var[c] = torch.sum(
+                    covs[:, c] * torch.unsqueeze(self.client_dist[:, c], 1), dim=0
+                ) / torch.sum(self.client_dist[:, c])
 
-            # self.covs[c] = (
-            #     torch.sum(covs[:, c, :, :] * (self.client_dist[:, c].unsqueeze(-1).unsqueeze(-1) - 1), dim=0) + \
-            #     torch.sum(torch.stack([torch.matmul(centers[i, c, :].unsqueeze(1), centers[i, c, :].unsqueeze(0)) * \
-            #                            (self.client_dist[i, c]) for i in range(covs.shape[0])], dim=0), dim=0) - \
-            #     torch.matmul(self.mean[c].unsqueeze(1), self.mean[c].unsqueeze(0)) * torch.sum(self.client_dist[:, c])) \
-            #         / (torch.sum(self.client_dist[:, c]) - 1)
-            # self.covs[c].add_(torch.eye(self.covs.shape[-1]) * 10)
-            #if np.sum(self.client_dist[:, c]) > 1:
-            #    self.var[c] = (
-            #        np.sum(np.stack([covs[i, c] * (self.client_dist[i, c] - 1) for i in range(covs.shape[0])], axis=0), axis=0) + \
-            #        np.sum(np.stack([np.expand_dims(centers[i, c], 1) * np.expand_dims(centers[i, c], 0) * (self.client_dist[i, c]) for \
-            #                               i in range(covs.shape[0])], axis=0), axis=0) - \
-            #        np.expand_dims(self.mean[c], 1) * np.expand_dims(self.mean[c], 0) * np.sum(self.client_dist[:, c])) \
-            #            / (np.sum(self.client_dist[:, c]) - 1)
-            # self.covs[c].add_(torch.eye(self.covs.shape[-1]) * 10)
         self.mean = self.mean.float()
         self.var = self.var.float()
         self.client_dist = self.client_dist.long()
@@ -490,37 +582,31 @@ class Server(Base_Server):
         sim = torch.zeros((self.num_classes, self.num_classes)).to(self.device)
         # inter class similarity
         for i in range(self.num_classes):
-            sim[i, :] = F.cosine_similarity(self.mean[i], \
-                self.mean, dim=1)
+            sim[i, :] = F.cosine_similarity(self.mean[i], self.mean, dim=1)
 
         return sim
 
-
     def operations(self, client_info):
 
-        client_info.sort(key=lambda tup: tup['client_index'])
-        client_sd = [c['weights'] for c in client_info]
-        cw = [c['num_samples'] / sum([x['num_samples'] for x in client_info]) for c in client_info]
+        client_info.sort(key=lambda tup: tup["client_index"])
+        client_sd = [c["weights"] for c in client_info]
+        cw = [
+            c["num_samples"] / sum([x["num_samples"] for x in client_info])
+            for c in client_info
+        ]
 
         ssd = self.model.state_dict()
         for key in ssd:
-            # if 'clf' in key:
-            #     labels_sum = torch.zeros(clients_label_dist[0].shape)
-            #     ssd[key] = torch.zeros(ssd[key].shape)
-            #     for label_dist, sd in zip(clients_label_dist, client_sd):
-            #         ssd[key] += label_dist.unsqueeze(1) * sd[key]
-            #         labels_sum += label_dist
-            #
-            #     ssd[key] = ssd[key] / labels_sum.unsqueeze(1)
-            # else:
             ssd[key] = sum([sd[key] * cw[i] for i, sd in enumerate(client_sd)])
-
+        start = time.time()
         self.sim = self.get_mean_var(client_info) * self.args.mu
-
+        mean_var = time.time()
         linear = self.retrain()
+        retrain = time.time()
+        logging.info(f"get_mean_var: {mean_var - start}, retrain: {retrain - mean_var}")
         sd = {}
-        sd['weight'] = linear.state_dict()['weight']
-        #sd.popitem('weight')
+        sd["weight"] = linear.state_dict()["weight"]
+        # sd.popitem('weight')
         # ssd['clf.weight'] = torch.clone(linear.weight.data.cpu())
         # ssd['clf.bias'] = torch.clone(linear.bias.data.cpu())
         self.model.load_state_dict(ssd)
@@ -530,45 +616,94 @@ class Server(Base_Server):
         #     for client in client_info:
         #         torch.save(client['weights'], '{}/client_{}.pt'.format(self.save_path, client['client_index']))
         self.round += 1
-        client_acc = np.mean([c['acc'] for c in client_info])
-        return [[self.model.cpu().state_dict(), torch.clone(self.sim.cpu())] for _ in range(self.args.thread_number)], client_acc
+        client_acc = np.mean([c["acc"] for c in client_info])
+        return [
+            [self.model.cpu().state_dict(), torch.clone(self.sim.cpu())]
+            for _ in range(self.args.thread_number)
+        ], client_acc
 
     def retrain(self):
-        linear = SoftmaxMargin(in_features_dict[self.args.net], self.num_classes, margin=self.sim.to(self.device)).to(self.device)
+        linear = SoftmaxMargin(
+            (
+                in_features_dict[self.args.net]
+                if self.args.net in in_features_dict
+                else 512
+            ),
+            self.num_classes,
+            margin=self.sim.to(self.device),
+        ).to(self.device)
         linear.load_state_dict(self.model.clf.state_dict())
-        optimizer = torch.optim.SGD(linear.parameters(), lr=self.args.lr,
-                                    momentum=0.9, weight_decay=self.args.wd, nesterov=True)
-        linear_g = SoftmaxMargin(in_features_dict[self.args.net], self.num_classes).to(self.device)
+        optimizer = torch.optim.SGD(
+            linear.parameters(),
+            lr=self.args.lr,
+            momentum=0.9,
+            weight_decay=self.args.wd,
+            nesterov=True,
+        )
+        linear_g = SoftmaxMargin(
+            (
+                in_features_dict[self.args.net]
+                if self.args.net in in_features_dict
+                else 512
+            ),
+            self.num_classes,
+        ).to(self.device)
         linear_g.load_state_dict(self.model.clf.state_dict())
         linear_g.margin = self.sim.to(self.device)
         total_dist = torch.sum(self.client_dist, dim=0).cpu()
-        virtual_representations = torch.zeros((int(torch.sum(total_dist).numpy()), self.mean.shape[-1]))
+        virtual_representations = torch.zeros(
+            (int(torch.sum(total_dist).numpy()), self.mean.shape[-1])
+        )
         virtual_labels = torch.zeros(int(torch.sum(total_dist).numpy())).long()
         cumsum = np.concatenate([[0], np.cumsum(total_dist.numpy())])
 
         criterion = torch.nn.CrossEntropyLoss()
+        start = time.time()
+        np_mean = self.mean.cpu().numpy()
+        np_var = self.var.cpu().numpy()
         for i in range(len(cumsum) - 1):
             # dist = torch.distributions.Normal(self.mean[i], self.var[i] + 1e-6).sample([int(cumsum[i+1] - cumsum[i])])
-            dist = np.random.multivariate_normal(self.mean[i].cpu().numpy(), np.diag(self.var[i].cpu().numpy()), size=int(cumsum[i+1] - cumsum[i]))
-            virtual_representations[int(cumsum[i]): int(cumsum[i+1])] = torch.tensor(dist)
-            virtual_labels[int(cumsum[i]): int(cumsum[i+1])] = i
+            # dist1 = np.random.multivariate_normal(np_mean[i], np.diag(np_var[i]), size=int(cumsum[i+1] - cumsum[i]))
+            dist2 = cp.random.multivariate_normal(
+                cp.asarray(np_mean[i]),
+                cp.diag(np_var[i]),
+                size=int(cumsum[i + 1] - cumsum[i]),
+                method="svd",
+            )
+            # import pdb; pdb.set_trace()
+            virtual_representations[int(cumsum[i]) : int(cumsum[i + 1])] = torch.tensor(
+                cp.asnumpy(dist2)
+            )
+            virtual_labels[int(cumsum[i]) : int(cumsum[i + 1])] = i
+        logging.info(f"feature init: {time.time() - start}")
         torch.cuda.empty_cache()
-        images, labels = virtual_representations.to(self.device), virtual_labels.to(self.device)
-        length_range = list(np.arange(0, len(images), len(images) // 20)) + [len(images)]
+        images, labels = virtual_representations.to(self.device), virtual_labels.to(
+            self.device
+        )
+        length_range = list(np.arange(0, len(images), len(images) // 4)) + [len(images)]
         for epoch in range(self.args.crt_epoch):
             # logging.info(images.shape)
             optimizer.zero_grad()
             for i in range(len(length_range) - 1):
-                logits = linear(images[length_range[i]: length_range[i+1]], labels[length_range[i]: length_range[i+1]])
-                logits_g = linear_g(images[length_range[i]: length_range[i+1]], labels[length_range[i]: length_range[i+1]])
-                loss = loss_fn_kd(logits, labels[length_range[i]: length_range[i+1]], logits_g) / 20
+                logits = linear(
+                    images[length_range[i] : length_range[i + 1]],
+                    labels[length_range[i] : length_range[i + 1]],
+                )
+                logits_g = linear_g(
+                    images[length_range[i] : length_range[i + 1]],
+                    labels[length_range[i] : length_range[i + 1]],
+                )
+                loss = (
+                    loss_fn_kd(
+                        logits, labels[length_range[i] : length_range[i + 1]], logits_g
+                    )
+                    / 4
+                )
                 loss.backward()
             optimizer.step()
 
         return linear
-    
-    
-    
+
     def test(self, client_acc):
         self.model.to(self.device)
         self.model.eval()
@@ -597,62 +732,139 @@ class Server(Base_Server):
                 test_correct += correct.item()
                 test_loss += loss.item() * target.size(0)
                 test_sample_number += target.size(0)
-                hs = h.detach() if hs is None else torch.cat([hs, h.detach().clone()], dim=0)
-                labelss = target if labelss is None else torch.cat([labelss, target.clone()], dim=0)
-                logits = pred.detach() if logits is None else torch.cat([logits, pred.detach().clone()], dim=0)
-                preds = predicted.detach() if preds is None else torch.cat([preds, predicted.detach().clone()], dim=0)
+                hs = (
+                    h.detach()
+                    if hs is None
+                    else torch.cat([hs, h.detach().clone()], dim=0)
+                )
+                labelss = (
+                    target
+                    if labelss is None
+                    else torch.cat([labelss, target.clone()], dim=0)
+                )
+                logits = (
+                    pred.detach()
+                    if logits is None
+                    else torch.cat([logits, pred.detach().clone()], dim=0)
+                )
+                preds = (
+                    predicted.detach()
+                    if preds is None
+                    else torch.cat([preds, predicted.detach().clone()], dim=0)
+                )
 
             acc = (test_correct / test_sample_number) * 100
-            loss = (test_loss / test_sample_number)
+            loss = test_loss / test_sample_number
             self.get_discriminability(hs, labelss)
             wandb_dict[self.args.method + "_acc".format(self.args.mu)] = acc
-            wandb_dict[self.args.method + "_client_acc_gap".format(self.args.mu)] = acc - client_acc
+            wandb_dict[self.args.method + "_client_acc_gap".format(self.args.mu)] = (
+                acc - client_acc
+            )
             wandb_dict[self.args.method + "_loss".format(self.args.mu)] = loss
-            wandb_dict[self.args.method + "_phi_{}".format(self.args.mu)] = torch.sum(self.inter) / torch.sum(
-                self.intra)
-            wandb_dict[self.args.method + "_sim_{}".format(self.args.mu)] = (torch.sum(self.sim) - self.num_classes) / (self.sim.shape[0] * (self.sim.shape[1] - 1))
+            wandb_dict[self.args.method + "_phi_{}".format(self.args.mu)] = torch.sum(
+                self.inter
+            ) / torch.sum(self.intra)
+            wandb_dict[self.args.method + "_sim_{}".format(self.args.mu)] = (
+                torch.sum(self.sim) - self.num_classes
+            ) / (self.sim.shape[0] * (self.sim.shape[1] - 1))
             wandb.log(wandb_dict)
             logging.info("************* Server Acc = {:.2f} **************".format(acc))
 
             if self.round == self.args.comm_round:
                 table = wandb.Table(data=pd.DataFrame(logits.cpu().numpy()))
-                wandb.log({'{} logits'.format(self.args.method): table})
-                
+                wandb.log({"{} logits".format(self.args.method): table})
+
                 matrix = confusion_matrix(labelss.cpu().numpy(), preds.cpu().numpy())
                 acc_per_class = matrix.diagonal() / matrix.sum(axis=1)
                 table = wandb.Table(
-                    data=pd.DataFrame({'class': [i for i in range(self.num_classes)], 'accuracy': acc_per_class}))
+                    data=pd.DataFrame(
+                        {
+                            "class": [i for i in range(self.num_classes)],
+                            "accuracy": acc_per_class,
+                        }
+                    )
+                )
 
                 wandb.log(
-                    {'{} accuracy for each class'.format(self.args.method): wandb.plot.bar(table, 'class', 'accuracy',
-                                                                                           title='Acc for each class')})
+                    {
+                        "{} accuracy for each class".format(
+                            self.args.method
+                        ): wandb.plot.bar(
+                            table, "class", "accuracy", title="Acc for each class"
+                        )
+                    }
+                )
 
-                fig, ax = plt.subplots(subplot_kw={'projection': 'polar'})
+                fig, ax = plt.subplots(subplot_kw={"projection": "polar"})
                 theta = np.arange(0, 2 * np.pi, 2 * np.pi / self.num_classes)
-                bar = ax.bar(theta, acc_per_class, alpha=0.5, width=2 * np.pi / self.num_classes)
+                bar = ax.bar(
+                    theta, acc_per_class, alpha=0.5, width=2 * np.pi / self.num_classes
+                )
                 for r, bar in zip(acc_per_class, bar):
                     bar.set_facecolor(plt.cm.rainbow(r))
 
-                wandb.log({"{} acc_per_class".format(self.args.method): wandb.Image(ax)})
-
-                table = wandb.Table(data=pd.DataFrame({'{} prediction'.format(self.args.method): preds.cpu().numpy()}))
-                wandb.log({'{} prediction'.format(self.args.method): table})
-
-                table = wandb.Table(data=pd.DataFrame(
-                    {'class': [i for i in range(self.num_classes)], 'phi': self.inter.detach().cpu().numpy()}))
-                wandb.log({'{} inter discriminability'.format(self.args.method): wandb.plot.bar(table, 'class', 'phi',
-                                                                                                title='Inter Discriminability'), })
-
-                table = wandb.Table(data=pd.DataFrame(
-                    {'class': [i for i in range(self.num_classes)], 'phi': self.intra.detach().cpu().numpy()}))
                 wandb.log(
-                    {'{} intra discriminability'.format(self.args.method): wandb.plot.bar(table, 'class', 'phi',
-                                                                                          title='Intra Discriminability')})
+                    {"{} acc_per_class".format(self.args.method): wandb.Image(ax)}
+                )
 
-                table = wandb.Table(data=pd.DataFrame(
-                    {'intra': self.intra.detach().cpu().numpy(), 'inter': self.inter.detach().cpu().numpy()}))
-                wandb.log({'{} intra / inter'.format(self.args.method): wandb.plot.scatter(table, 'intra', 'inter',
-                                                                                           title='Intra / Inter')})
+                table = wandb.Table(
+                    data=pd.DataFrame(
+                        {"{} prediction".format(self.args.method): preds.cpu().numpy()}
+                    )
+                )
+                wandb.log({"{} prediction".format(self.args.method): table})
+
+                table = wandb.Table(
+                    data=pd.DataFrame(
+                        {
+                            "class": [i for i in range(self.num_classes)],
+                            "phi": self.inter.detach().cpu().numpy(),
+                        }
+                    )
+                )
+                wandb.log(
+                    {
+                        "{} inter discriminability".format(
+                            self.args.method
+                        ): wandb.plot.bar(
+                            table, "class", "phi", title="Inter Discriminability"
+                        ),
+                    }
+                )
+
+                table = wandb.Table(
+                    data=pd.DataFrame(
+                        {
+                            "class": [i for i in range(self.num_classes)],
+                            "phi": self.intra.detach().cpu().numpy(),
+                        }
+                    )
+                )
+                wandb.log(
+                    {
+                        "{} intra discriminability".format(
+                            self.args.method
+                        ): wandb.plot.bar(
+                            table, "class", "phi", title="Intra Discriminability"
+                        )
+                    }
+                )
+
+                table = wandb.Table(
+                    data=pd.DataFrame(
+                        {
+                            "intra": self.intra.detach().cpu().numpy(),
+                            "inter": self.inter.detach().cpu().numpy(),
+                        }
+                    )
+                )
+                wandb.log(
+                    {
+                        "{} intra / inter".format(self.args.method): wandb.plot.scatter(
+                            table, "intra", "inter", title="Intra / Inter"
+                        )
+                    }
+                )
         return acc
 
     def finalize(self):

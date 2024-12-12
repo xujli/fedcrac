@@ -90,10 +90,10 @@ class Base_Client():
                 batch_loss.append(loss.item())
             if len(batch_loss) > 0:
                 epoch_loss.append(sum(batch_loss) / len(batch_loss))
-                logging.info(
-                    'client {}. Local Training Epoch: {} \tLoss: {:.6f}  Thread {}  Map {}'.format(self.client_index,
-                                                                                                    epoch, sum(
-                            epoch_loss) / len(epoch_loss), current_process()._identity[0], self.client_map[self.round]))
+                # logging.info(
+                #     'client {}. Local Training Epoch: {} \tLoss: {:.6f}  Thread {}  Map {}'.format(self.client_index,
+                #                                                                                     epoch, sum(
+                #             epoch_loss) / len(epoch_loss), current_process()._identity[0], self.client_map[self.round]))
 
         # estimate
         features = None
@@ -146,9 +146,9 @@ class Base_Client():
             wandb_dict[self.args.method + "_clinet:{}_acc".format(self.client_index)] = acc
             # wandb_dict[self.args.method + "_loss"] = loss
             # wandb.log(wandb_dict)
-            logging.info(
-                "************* Round {} Client {} Acc = {:.2f} **************".format(self.round, self.client_index,
-                                                                                      acc))
+            # logging.info(
+            #     "************* Round {} Client {} Acc = {:.2f} **************".format(self.round, self.client_index,
+            #                                                                           acc))
 
         return acc
 
@@ -175,9 +175,9 @@ class Base_Client():
 
                 test_sample_number += target.size(0)
             acc = (preds / client_cnts * (client_cnts / client_cnts.sum())) * 100
-            logging.info(
-                "************* Round {} Client {} Per Acc = {:.2f} **************".format(self.round, self.client_index,
-                                                                                          acc))
+            # logging.info(
+            #     "************* Round {} Client {} Per Acc = {:.2f} **************".format(self.round, self.client_index,
+            #                                                                               acc))
 
         return acc
 
@@ -233,7 +233,7 @@ class Base_Server():
         self.device = 'cuda:{}'.format(torch.cuda.device_count() - 1)
         self.model_type = server_dict['model_type']
         self.num_classes = server_dict['num_classes']
-        self.acc = 0.0
+        self.acc = []
         self.round = 0
         self.args = args
         self.criterion = torch.nn.CrossEntropyLoss()
@@ -243,9 +243,9 @@ class Base_Server():
         server_outputs, clinet_acc = self.operations(received_info)
         acc = self.test(clinet_acc)
         self.log_info(received_info, acc)
-        if acc > self.acc:
+        if self.acc and (acc > max(self.acc)):
             torch.save(self.model.state_dict(), '{}/{}.pt'.format(self.save_path, 'server'))
-            self.acc = acc
+        self.acc.append(acc)
         return server_outputs
 
     def start(self):
@@ -382,6 +382,7 @@ class Base_Server():
             logging.info("************* Server Acc = {:.2f} **************".format(acc))
 
             if self.round == self.args.comm_round:
+                logging.info("************* Max Server Acc = {:.2f}, Mean Acc of Last 10 Rounds = {:.2f} **************".format(max(self.acc), np.mean(self.acc[-10:])))
                 table = wandb.Table(data=pd.DataFrame(logits.cpu().numpy()))
                 wandb.log({'{} logits'.format(self.args.method): table})
                 

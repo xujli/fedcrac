@@ -24,7 +24,6 @@ from models.MLP import MLP
 from models.lenet5 import Lenet5
 from models.neurallog import NeuralLog, Head
 from models.mobilenet import mobilenet
-from models.Sent140LSTM import Sent140LSTM
 from torch.multiprocessing import set_start_method, Queue
 import logging
 import os
@@ -37,8 +36,7 @@ import data_preprocessing.custom_multiprocess as cm
 np.set_printoptions(threshold=np.inf)
 torch.multiprocessing.set_sharing_strategy("file_system")
 
-os.environ["WANDB_API_KEY"] = "c2837c6d9f0b2b836c42d0812fb9c4366d712d90"
-# os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_MODE"] = "disabled"
 
 
 # Setup Functions
@@ -107,6 +105,7 @@ if __name__ == "__main__":
     odds = "LT" if args.LT else ""
     project_name = "FLMC_exp" + ("_M" if args.momentum else "")
     wandb.init(
+        mode="disabled",
         entity="lxjxlxj",
         project=project_name,
         group=args.data_dir.split("/")[-1]
@@ -215,7 +214,7 @@ if __name__ == "__main__":
         "fedmargin",
         "fedgmmargin",
         "fedgmmargin2",
-        "fedgmmargin3",
+        "fedcrac",
         "fedgmmargin7",
         "fedgmmargin4",
         "fedgmmargin5",
@@ -445,9 +444,9 @@ if __name__ == "__main__":
         client_outputs = [c for sublist in client_outputs for c in sublist]
         server_outputs = server.run(client_outputs)
         round_end = time.time()
-        logging.info("Round {} Time: {}s".format(r, round_end - round_start))
+        # logging.info("Round {} Time: {}s".format(r, round_end - round_start))
 
-    server.finalize()
+    # server.finalize()
     pool.close()
     pool.join()
     wandb.finish()
